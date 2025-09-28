@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
@@ -29,6 +29,8 @@ namespace WallVentLink
         private const int TrapezoidRenderQueue = 2460;
         private const int OutlineRenderQueue = 2470;
 
+        private const float OutlineRotationOffsetDegrees = 90f;
+
         public WallVentLinkMapComponent(Map map) : base(map) { }
 
         public override void FinalizeInit()
@@ -47,19 +49,18 @@ namespace WallVentLink
 
         public void DrawAllCustom()
         {
+            // Only draw if this map is active
             if (Find.CurrentMap != map) return;
 
             if (trapezoidMesh == null)
                 trapezoidMesh = GenerateTrapezoidMesh();
-
             if (edgeQuadMesh == null)
                 edgeQuadMesh = new Mesh();
 
-            if (trackedVents.Count == 0)
-                RefreshVentsFromMap();
-            if (trackedWalls.Count == 0)
-                RefreshWallsFromMap();
+            if (trackedVents.Count == 0) RefreshVentsFromMap();
+            if (trackedWalls.Count == 0) RefreshWallsFromMap();
 
+            // Draw vents first
             var ventsByX = trackedVents.OfType<Building>()
                 .Where(b => b.Rotation == Rot4.East || b.Rotation == Rot4.West)
                 .GroupBy(b => b.Position.x)
@@ -75,6 +76,7 @@ namespace WallVentLink
                 }
             }
 
+            // Draw walls last (trapezoids + outlines)
             foreach (var wall in trackedWalls.ToList())
             {
                 if (!IsWallLike(wall))
@@ -82,6 +84,7 @@ namespace WallVentLink
                     trackedWalls.Remove(wall);
                     continue;
                 }
+
                 DrawTrapezoidAndOutline(wall);
             }
         }
@@ -128,12 +131,12 @@ namespace WallVentLink
 
             IntVec3 northCell = wall.Position + IntVec3.North;
             Thing northBuilding = northCell.InBounds(map)
-                ? map.thingGrid.ThingsListAtFast(northCell)
-                    .FirstOrDefault(t => t?.def?.category == ThingCategory.Building)
+                ? map.thingGrid.ThingsListAtFast(northCell).FirstOrDefault(t => t?.def?.category == ThingCategory.Building)
                 : null;
 
             bool northHasVent = northBuilding != null && IsVentOrCooler(northBuilding);
-            bool shouldDrawTrapezoid = northBuilding != null && (IsWallLike(northBuilding) || northHasVent);
+
+            bool shouldDrawTrapezoid = northHasVent || (IsWallLike(northBuilding) && !SameStuff(wall, northBuilding));
             if (!shouldDrawTrapezoid) return;
 
             Vector3 trapezoidPos = wall.TrueCenter();
@@ -150,6 +153,15 @@ namespace WallVentLink
                 outlinePos.y += OutlineYIncrement;
                 DrawOutlineQuads(outlinePos, oMat);
             }
+        }
+
+        private static bool SameStuff(Thing a, Thing b)
+        {
+            if (a == null || b == null) return false;
+            if (a.def != b.def) return false;
+            if (a.Stuff != null || b.Stuff != null)
+                return a.Stuff == b.Stuff;
+            return true;
         }
 
         private Material GetTrapezoidMaterialForWall(Thing wall)
@@ -180,46 +192,43 @@ namespace WallVentLink
             Vector3 ns = new Vector3(-northWidth * 0.5f, 0f, halfDepth);
             Vector3 nr = new Vector3(northWidth * 0.5f, 0f, halfDepth);
 
-            DrawEdgeQuad(ns, nr, center, thickness, outlineMat, OutlineRenderQueue); // north
-            //DrawEdgeQuad(ss, sr, center, thickness, outlineMat, OutlineRenderQueue); // south
-            DrawEdgeQuad(ss, ns, center, thickness, outlineMat, OutlineRenderQueue); // west
-            DrawEdgeQuad(sr, nr, center, thickness, outlineMat, OutlineRenderQueue); // east
+            // north, west, east edges (south outline suppressed)
+            DrawEdgeQuad(ns, nr, center, thickness, outlineMat, OutlineRenderQueue, invertInward: true); // north
+            DrawEdgeQuad(ss, ns, center, thickness, outlineMat, OutlineRenderQueue, invertInward: true); // west
+            DrawEdgeQuad(sr, nr, center, thickness, outlineMat, OutlineRenderQueue, invertInward: false); // east
         }
 
-        // Draw a flat (face-up) quad aligned with an edge of the trapezoid.
         private void DrawEdgeQuad(
-    Vector3 aLocal, Vector3 bLocal, Vector3 worldCenter,
-    float thickness, Material baseMat, int renderQueue)
+            Vector3 aLocal, Vector3 bLocal, Vector3 worldCenter,
+            float thickness, Material baseMat, int renderQueue,
+            bool invertInward = false)
         {
-            // World positions
             Vector3 aWorld = worldCenter + aLocal;
             Vector3 bWorld = worldCenter + bLocal;
 
-            // Midpoint
             Vector3 midPoint = (aWorld + bWorld) * 0.5f;
 
-            // Edge direction in XZ plane
-            Vector3 edgeDir = (bWorld - aWorld);
+            Vector3 edgeDir = bWorld - aWorld;
             edgeDir.y = 0f;
             float edgeLength = edgeDir.magnitude;
+            if (edgeLength < 0.0001f) return;
 
-            if (edgeLength < 0.0001f) return; // safety guard
+            Vector3 edgeDirNorm = edgeDir.normalized;
+            Vector3 inward = new Vector3(-edgeDirNorm.z, 0f, edgeDirNorm.x); // 90° CW
+            if (invertInward) inward = -inward;
 
-            // Rotation: rotate around Y only
-            float angle = Mathf.Atan2(edgeDir.x, edgeDir.z) * Mathf.Rad2Deg + 90f;
+            midPoint += inward * (thickness * 0.5f);
+
+            float angle = Mathf.Atan2(edgeDir.x, edgeDir.z) * Mathf.Rad2Deg + OutlineRotationOffsetDegrees;
             Quaternion rotation = Quaternion.Euler(0f, angle, 0f);
 
-            // Scale: X = length of edge, Z = thickness
             Vector3 scale = new Vector3(edgeLength, 1f, thickness);
 
-            // Cached material with correct renderQueue
             Material mat = GetOrCreateCachedMaterial(baseMat, renderQueue);
-
-            // Face-up, long edge along trapezoid edge
             Matrix4x4 matrix = Matrix4x4.TRS(midPoint, rotation, scale);
+
             Graphics.DrawMesh(MeshPool.plane10, matrix, mat, 0);
         }
-
         #endregion
 
         #region detection helpers
@@ -245,13 +254,11 @@ namespace WallVentLink
         private static bool IsWallLike(Thing t)
         {
             if (t == null) return false;
-            if (t is Blueprint || t is Frame) return false; // skip blueprints/frames
-            if (!t.def.IsEdifice()) return false;           // only real edifices
-
+            if (t is Blueprint || t is Frame) return false;
+            if (!t.def.IsEdifice()) return false;
             if (t.def == ThingDefOf.Wall) return true;
             if (IsSmoothedNaturalStoneWall(t)) return true;
             if (t.def?.graphicData?.linkFlags.HasFlag(LinkFlags.Wall) ?? false) return true;
-
             return false;
         }
 
