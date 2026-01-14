@@ -18,7 +18,7 @@ namespace WallVentLink
         private readonly Dictionary<int, Material> materialCache = new Dictionary<int, Material>();
 
         private Material outlineMaterial;
-        private Mesh edgeQuadMesh;
+        // removed unused edgeQuadMesh
 
         private const float BaseVentYOffset = 0.02f;
         private const float VentYOffsetIncrement = 0.001f;
@@ -40,6 +40,52 @@ namespace WallVentLink
             RefreshVentsFromMap();
         }
 
+        // cleanup resources when the map is removed (prevents leaking Materials / Meshes)
+        public override void MapRemoved()
+        {
+            ClearCaches();
+            base.MapRemoved();
+        }
+
+        private void ClearCaches()
+        {
+            // Destroy cloned materials in materialCache
+            if (materialCache != null)
+            {
+                foreach (var kv in materialCache)
+                {
+                    var mat = kv.Value;
+                    if (mat != null)
+                        UnityEngine.Object.Destroy(mat);
+                }
+                materialCache.Clear();
+            }
+
+            // Destroy materials created for trapezoids
+            if (trapezoidMaterials != null)
+            {
+                foreach (var kv in trapezoidMaterials)
+                {
+                    var mat = kv.Value;
+                    if (mat != null)
+                        UnityEngine.Object.Destroy(mat);
+                }
+                trapezoidMaterials.Clear();
+            }
+
+            if (outlineMaterial != null)
+            {
+                UnityEngine.Object.Destroy(outlineMaterial);
+                outlineMaterial = null;
+            }
+
+            if (trapezoidMesh != null)
+            {
+                UnityEngine.Object.Destroy(trapezoidMesh);
+                trapezoidMesh = null;
+            }
+        }
+
         #region registration
         public void RegisterWall(Thing wall) { if (wall != null) trackedWalls.Add(wall); }
         public void UnregisterWall(Thing wall) { if (wall != null) trackedWalls.Remove(wall); }
@@ -54,20 +100,30 @@ namespace WallVentLink
 
             if (trapezoidMesh == null)
                 trapezoidMesh = GenerateTrapezoidMesh();
-            if (edgeQuadMesh == null)
-                edgeQuadMesh = new Mesh();
 
             if (trackedVents.Count == 0) RefreshVentsFromMap();
             if (trackedWalls.Count == 0) RefreshWallsFromMap();
 
             // Draw vents first
-            var ventsByX = trackedVents.OfType<Building>()
-                .Where(b => b.Rotation == Rot4.East || b.Rotation == Rot4.West)
-                .GroupBy(b => b.Position.x)
-                .ToDictionary(g => g.Key, g => g.OrderBy(b => b.Position.z).ToList());
-
-            foreach (var column in ventsByX.Values)
+            // Avoid heavy LINQ allocations: manual grouping
+            var ventsByX = new Dictionary<int, List<Building>>();
+            foreach (var t in trackedVents)
             {
+                if (!(t is Building b)) continue;
+                if (b.Rotation != Rot4.East && b.Rotation != Rot4.West) continue;
+                int x = b.Position.x;
+                if (!ventsByX.TryGetValue(x, out var list))
+                {
+                    list = new List<Building>();
+                    ventsByX[x] = list;
+                }
+                list.Add(b);
+            }
+
+            foreach (var kv in ventsByX)
+            {
+                var column = kv.Value;
+                column.Sort((a, b) => a.Position.z.CompareTo(b.Position.z)); // stable, fewer allocations than LINQ
                 for (int i = 0; i < column.Count; i++)
                 {
                     var vent = column[i];
@@ -77,15 +133,23 @@ namespace WallVentLink
             }
 
             // Draw walls last (trapezoids + outlines)
-            foreach (var wall in trackedWalls.ToList())
+            // Avoid ToList allocation and modification during enumeration: collect toRemove separately
+            List<Thing> toRemove = null;
+            foreach (var wall in trackedWalls)
             {
                 if (!IsWallLike(wall))
                 {
-                    trackedWalls.Remove(wall);
+                    if (toRemove == null) toRemove = new List<Thing>();
+                    toRemove.Add(wall);
                     continue;
                 }
 
                 DrawTrapezoidAndOutline(wall);
+            }
+            if (toRemove != null)
+            {
+                foreach (var r in toRemove)
+                    trackedWalls.Remove(r);
             }
         }
 
@@ -114,6 +178,7 @@ namespace WallVentLink
             if (ventMat == null) return;
 
             Material mat = GetOrCreateCachedMaterial(ventMat, VentRenderQueue);
+            if (mat == null) return;
 
             Vector3 pos = b.TrueCenter();
             pos.y = Altitudes.AltitudeFor(AltitudeLayer.Building) + yOffset;
@@ -144,7 +209,8 @@ namespace WallVentLink
             trapezoidPos.z += 0.5f + 0.225f * 0.5f;
 
             Material trapezoidMat = GetTrapezoidMaterialForWall(wall);
-            Graphics.DrawMesh(trapezoidMesh, trapezoidPos, Quaternion.identity, trapezoidMat, 0);
+            if (trapezoidMat != null && trapezoidMesh != null)
+                Graphics.DrawMesh(trapezoidMesh, trapezoidPos, Quaternion.identity, trapezoidMat, 0);
 
             if (northHasVent)
             {
@@ -225,6 +291,7 @@ namespace WallVentLink
             Vector3 scale = new Vector3(edgeLength, 1f, thickness);
 
             Material mat = GetOrCreateCachedMaterial(baseMat, renderQueue);
+            if (mat == null) return;
             Matrix4x4 matrix = Matrix4x4.TRS(midPoint, rotation, scale);
 
             Graphics.DrawMesh(MeshPool.plane10, matrix, mat, 0);
