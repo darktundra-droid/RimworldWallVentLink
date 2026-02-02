@@ -15,14 +15,35 @@ namespace WallVentLink
             Log.Message("[WallVentLink] Harmony patches applied");
         }
 
+        // Keep the MapInterface update wrapper robust: don't let exceptions here stop other mods
         [HarmonyPatch(typeof(MapInterface), "MapInterfaceUpdate")]
         static class MapInterfaceUpdate_DrawCustom
         {
             static void Postfix()
             {
-                foreach (Map map in Find.Maps)
-                    map.GetComponent<WallVentLinkMapComponent>()?.DrawAllCustom();
+                try
+                {
+                    foreach (Map map in Find.Maps)
+                    {
+                        map.GetComponent<WallVentLinkMapComponent>()?.DrawAllCustom();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"[WallVentLink] Exception in MapInterfaceUpdate_DrawCustom postfix: {ex}");
+                }
             }
+        }
+
+        // Helper to detect smoothed/rock-smooth walls (kept local and explicit)
+        private static bool IsSmoothedWall(Thing t)
+        {
+            if (t == null) return false;
+            string tex = t.def?.graphicData?.texPath ?? "";
+            string defName = t.def?.defName ?? "";
+            if (!string.IsNullOrEmpty(tex) && tex.IndexOf("RockSmooth_Atlas", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (!string.IsNullOrEmpty(defName) && defName.IndexOf("Smoothed", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
         }
 
         private static void RegisterWallOrVent(Building building)
@@ -31,11 +52,17 @@ namespace WallVentLink
             var comp = building.Map.GetComponent<WallVentLinkMapComponent>();
             if (comp == null) return;
 
+            // Register anything that links as a wall
             if (building.def.graphicData?.linkFlags.HasFlag(LinkFlags.Wall) ?? false)
                 comp.RegisterWall(building);
 
+            // Register vents/coolers
             if (WallVentLinkMapComponent.IsVentOrCooler(building))
                 comp.RegisterVent(building);
+
+            // Explicitly register smoothed walls (some defs do not set link flags)
+            if (IsSmoothedWall(building))
+                comp.RegisterWall(building);
         }
 
         private static void UnregisterWallOrVent(Thing thing)
@@ -44,8 +71,10 @@ namespace WallVentLink
             var comp = thing.Map.GetComponent<WallVentLinkMapComponent>();
             if (comp == null) return;
 
-            if (thing.def.graphicData?.linkFlags.HasFlag(LinkFlags.Wall) ?? false ||
-                (!string.IsNullOrEmpty(thing.def.graphicData?.texPath) && thing.def.graphicData.texPath.IndexOf("RockSmooth", StringComparison.OrdinalIgnoreCase) >= 0))
+            bool isWallLikeFlag = thing.def.graphicData?.linkFlags.HasFlag(LinkFlags.Wall) ?? false;
+            bool isSmoothed = IsSmoothedWall(thing);
+
+            if (isWallLikeFlag || isSmoothed)
             {
                 comp.UnregisterWall(thing);
             }
@@ -59,22 +88,23 @@ namespace WallVentLink
         {
             public static void Postfix(Building __instance, Map map, bool respawningAfterLoad)
             {
+                // Register newly spawned building as wall/vent as appropriate
                 RegisterWallOrVent(__instance);
-
-                // Explicitly register smoothed walls
-                if (!string.IsNullOrEmpty(__instance.def?.graphicData?.texPath) &&
-                    __instance.def.graphicData.texPath.IndexOf("RockSmooth_Atlas", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    (!string.IsNullOrEmpty(__instance.def?.defName) &&
-                    __instance.def.defName.IndexOf("Smoothed", StringComparison.OrdinalIgnoreCase) >= 0))
-                {
-                    map.GetComponent<WallVentLinkMapComponent>()?.RegisterWall(__instance);
-                }
             }
         }
 
+        // Two explicit patches: DeSpawn and Destroy. Keep them separate and safe.
         [HarmonyPatch(typeof(Thing), nameof(Thing.DeSpawn))]
+        public static class Thing_DeSpawn_Unregister
+        {
+            public static void Prefix(Thing __instance)
+            {
+                UnregisterWallOrVent(__instance);
+            }
+        }
+
         [HarmonyPatch(typeof(Thing), nameof(Thing.Destroy))]
-        public static class Thing_Unregister
+        public static class Thing_Destroy_Unregister
         {
             public static void Prefix(Thing __instance)
             {
@@ -87,26 +117,32 @@ namespace WallVentLink
         {
             static void Postfix(IntVec3 c, Thing parent, ref bool __result)
             {
-                if (__result) return;
-                if (parent?.Map == null) return;
-
-                IntVec3 offset = c - parent.Position;
-                if (Math.Abs(offset.x) + Math.Abs(offset.z) != 1) return; // cardinal only
-
-                bool parentIsWallLike = parent.def.graphicData?.linkFlags.HasFlag(LinkFlags.Wall) ?? false;
-                bool parentIsSmoothedWall = !string.IsNullOrEmpty(parent.def?.defName) &&
-                    parent.def.defName.IndexOf("Smoothed", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                if (!(parentIsWallLike || parentIsSmoothedWall)) return;
-
-                var thingsAtCell = parent.Map.thingGrid.ThingsListAtFast(c);
-                foreach (var t in thingsAtCell)
+                try
                 {
-                    if (WallVentLinkMapComponent.IsVentOrCooler(t))
+                    if (__result) return;
+                    if (parent?.Map == null) return;
+
+                    IntVec3 offset = c - parent.Position;
+                    if (Math.Abs(offset.x) + Math.Abs(offset.z) != 1) return; // cardinal only
+
+                    bool parentIsWallLike = parent.def.graphicData?.linkFlags.HasFlag(LinkFlags.Wall) ?? false;
+                    bool parentIsSmoothedWall = IsSmoothedWall(parent);
+
+                    if (!(parentIsWallLike || parentIsSmoothedWall)) return;
+
+                    var thingsAtCell = parent.Map.thingGrid.ThingsListAtFast(c);
+                    foreach (var t in thingsAtCell)
                     {
-                        __result = true;
-                        break;
+                        if (WallVentLinkMapComponent.IsVentOrCooler(t))
+                        {
+                            __result = true;
+                            break;
+                        }
                     }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"[WallVentLink] Exception in Graphic_Linked_ShouldLinkWith_Patch postfix: {ex}");
                 }
             }
         }
